@@ -1,51 +1,66 @@
 #!/usr/env/python
 
-import requests
+from botocore.vendored import requests
 import time
-import os
 import base64
 import json
+import kms
+import os
 
+GH_API_BASE_URL = 'https://api.github.com'
 
 class GithubHandler(object):
 
-    GH_API_BASE_URL = 'https://api.github.com'
-    GH_API_TOKEN = 'asdfaskfjasdklfasdfdasfas'
-
-    def __init__(self):
+    def __init__(self, token):
         self.session = requests.Session()
-        self.session.headers.update(
-            {'Authorization': 'token {}'.format(self.GH_API_TOKEN)})
+        self.session.headers.update({'Authorization': 'token {}'.format(token)})
+        self.org = self.get_whoami()
 
-    def perform_file_update_with_pull_request(self, repo_full_name, path, updated_content, message):
+    def perform_file_update_with_pull_request(self, target_org, repo, branch, path, updated_content, message):
+        self.delete_repo(repo)
+        self.fork_repo(target_org, repo)
 
-        local_owner = self._perform_gh_request('GET', '/user').json()['login']
-        repo = os.path.basename(repo_full_name)
-
-        self._perform_gh_request('DELETE', '/repos/{}/{}'.format(local_owner, repo), ok_status=[404])
-        #self._perform_gh_request('GET', '/repos/{}/{}'.format(local_owner, repo), ok_status=[404], retry_until_status=404)
-        self._perform_gh_request('POST', '/repos/{}/forks'.format(repo_full_name))
-
-        obj_in_fork = self._perform_gh_request('GET', '/repos/{}/{}/contents/{}?ref=master'.
-                                               format(local_owner, repo, path), retry_until_status=200)
-
-        obj_in_fork = obj_in_fork.json()
-
-        last_sha = obj_in_fork['sha']
-
-        content = base64.standard_b64decode(obj_in_fork['content'])
-
+        file_obj = self.get_file_object(self.org, repo, 'mapping.yaml', branch)
+        content = base64.standard_b64decode(file_obj['content'])
         if content == updated_content:
-            print('Update already applied in fork for {}'.format(repo_full_name))
+            print('Update already applied in fork for {}/{}'.format(target_org, repo))
             return
 
-        self._perform_gh_request('PUT', '/repos/{}/{}/contents/{}'.format(local_owner, repo, path),
-                                 data=json.dumps(
-                                     {'message': message, 'content': base64.standard_b64encode(updated_content),
-                                      'sha': last_sha, 'branch': 'master'}), retry_until_status=200)
+        updated_content = base64.standard_b64encode(updated_content.encode('utf-8'))
+        self.commit_file(repo, path, branch, message, updated_content, file_obj['sha'])
+        response = self.create_pull_request(target_org, repo, branch, branch, message)
+        return json.loads(response.text)['html_url']
 
-        self._perform_gh_request('POST', '/repos/' + repo_full_name + '/pulls',
-                                 data=json.dumps({'title': message, 'head': local_owner + ':master', 'base': 'master'}))
+    def get_whoami(self):
+        return self._perform_gh_request('GET', '/user').json()['login']
+
+    def delete_repo(self, repo):
+        self._perform_gh_request('DELETE', '/repos/{}/{}'.format(self.org, repo), ok_status=[404])
+
+    def fork_repo(self, remote_org, remote_repo):
+        self._perform_gh_request('POST', '/repos/{}/{}/forks'.format(remote_org, remote_repo))
+
+    def create_pull_request(self, org, repo, source_branch, branch, message):
+        return self._perform_gh_request('POST', '/repos/{}/{}/pulls'.format(org, repo),
+                                        data=json.dumps({
+                                         'title': message,
+                                         'head': self.get_whoami() + ':' + source_branch,
+                                         'base': branch}))
+
+    def get_contents_of_file(self, org, repo, path, branch):
+        response = self.get_file_object(org, repo, path, branch)
+        return base64.decodebytes(response.content)['content'].encode()
+
+    def get_file_object(self, org, repo, path, branch):
+        return self._perform_gh_request('GET',
+                                        '/repos/{}/{}/contents/{}?ref={}'.format(
+                                            org, repo, path, branch)).json()
+
+    def commit_file(self, repo, path, branch, message, updated_content, last_sha):
+        self._perform_gh_request('PUT', '/repos/{}/{}/contents/{}'.format(self.org, repo, path),
+                                 data=json.dumps(
+                                     {'message': message, 'content': updated_content.decode(),
+                                      'sha': last_sha, 'branch': branch}), retry_until_status=200)
 
     def _perform_gh_request(self, method, path, data=None, ok_status=[], retry_until_status=None):
         max_retries = 10
